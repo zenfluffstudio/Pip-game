@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Pip's Chai Run ☕🐾</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #FFF8F0;
+    font-family: 'Baloo 2', 'Comic Sans MS', 'Trebuchet MS', sans-serif;
+    overflow: hidden;
+    touch-action: none;
+  }
+  #wrap {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; width: 100%;
+  }
+  #gameCanvas {
+    background: #E8F4FD;
+    border-radius: 18px;
+    box-shadow: 0 8px 24px rgba(107,66,38,0.25);
+    max-width: 100vw;
+    max-height: 100vh;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gameCanvas" width="400" height="600"></canvas>
+</div>
+
+<script>
+(function(){
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const BASE_W = 400, BASE_H = 600;
+
+  // ---------- Responsive scaling ----------
+  function resize(){
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const scale = Math.min(vw / BASE_W, vh / BASE_H, 1);
+    canvas.style.width = (BASE_W * scale) + 'px';
+    canvas.style.height = (BASE_H * scale) + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Persistence ----------
+  const SAVE_KEY = 'pipsChaiRunSave';
+  function loadSave(){
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch(e){}
+    return { highScore: 0, totalChai: 0, unlocks: {}, musicOn: true };
+  }
+  function writeSave(){
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch(e){}
+  }
+  let save = loadSave();
+  if (typeof save.musicOn !== 'boolean') save.musicOn = true;
+
+  // ---------- Colors ----------
+  const COL = {
+    orange: '#E8943A',
+    orangeDark: '#D9822A',
+    cream: '#F5EDD6',
+    pakol: '#6B4226',
+    outline: '#5C3317',
+    bg: '#FFF8F0',
+    ground: '#6B4226',
+    sky: '#E8F4FD',
+    pink: '#F4A6B7',
+    text: '#5C3317',
+    chaiBrown: '#8B5A2B',
+    chaiGold: '#E8B84A'
+  };
+
+  // ---------- Sound (WebAudio, simple synthesized) ----------
+  let audioCtx = null;
+  function ac(){
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(()=>{});
+    }
+    return audioCtx;
+  }
+  function beep(freq, dur, type, vol, delay){
+    delay = delay || 0;
+    try {
+      const c = ac();
+      const t0 = c.currentTime + delay;
+      const osc = c.createOscillator();
+      const gain = c.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, t0);
+      gain.gain.setValueAtTime(vol || 0.15, t0);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+      osc.connect(gain); gain.connect(c.destination);
+      osc.start(t0); osc.stop(t0 + dur);
+    } catch(e){}
+  }
+  function sfxCollect(){ beep(880, 0.12, 'sine', 0.18); beep(1200, 0.1, 'sine', 0.1, 0.05); }
+  function sfxHit(){ beep(140, 0.2, 'square', 0.15); }
+  function sfxUnlock(){ [523,659,784,1047].forEach((f,i)=>beep(f,0.18,'triangle',0.16,i*0.09)); }
+  function sfxGameOver(){ beep(300,0.3,'sawtooth',0.12); beep(180,0.4,'sawtooth',0.12,0.15); }
+
+  // ---------- Background music (synthesized loop) ----------
+  let musicGain = null;
+  let musicNextLoopTime = 0;
+  const MUSIC_TEMPO = 0.32; // seconds per step
+  // A cozy, playful 16-step melody (C major pentatonic-ish) with a soft bass line
+  const MUSIC_MELODY = [
+    523, 0, 659, 0, 784, 659, 523, 0,
+    587, 0, 698, 587, 523, 0, 440, 0
+  ];
+  const MUSIC_BASS = [
+    262, 0,0,0, 196, 0,0,0, 220, 0,0,0, 196, 0,0,0
+  ];
+  const MUSIC_LOOP_LEN = MUSIC_MELODY.length * MUSIC_TEMPO;
+
+  function ensureMusicGain(){
+    if (!musicGain) {
+      const c = ac();
+      musicGain = c.createGain();
+      musicGain.gain.value = save.musicOn ? 0.5 : 0;
+      musicGain.connect(c.destination);
+    }
+    return musicGain;
+  }
+
+  function scheduleMusicNote(freq, startTime, dur, type, vol){
+    if (!freq) return;
+    const c = ac();
+    const osc = c.createOscillator();
+    const gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, startTime);
+    gain.gain.setValueAtTime(0.0001, startTime);
+    gain.gain.linearRampToValueAtTime(vol, startTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startTime + dur);
+    osc.connect(gain);
+    gain.connect(ensureMusicGain());
+    osc.start(startTime);
+    osc.stop(startTime + dur + 0.05);
+  }
+
+  function scheduleMusicLoop(loopStart){
+    for (let i=0;i<MUSIC_MELODY.length;i++){
+      const t = loopStart + i*MUSIC_TEMPO;
+      scheduleMusicNote(MUSIC_MELODY[i], t, MUSIC_TEMPO*0.9, 'triangle', 0.55);
+      scheduleMusicNote(MUSIC_BASS[i], t, MUSIC_TEMPO*0.9, 'sine', 0.5);
+    }
+  }
+
+  function updateMusicScheduler(){
+    if (!audioCtx) return;
+    const c = audioCtx;
+    // (re)sync if this is the first run, or if we've fallen behind (e.g. tab was backgrounded)
+    if (musicNextLoopTime === 0 || musicNextLoopTime < c.currentTime) {
+      musicNextLoopTime = c.currentTime + 0.05;
+    }
+    while (musicNextLoopTime < c.currentTime + 1.2) {
+      scheduleMusicLoop(musicNextLoopTime);
+      musicNextLoopTime += MUSIC_LOOP_LEN;
+    }
+  }
+
+  function toggleMusic(){
+    save.musicOn = !save.musicOn;
+    writeSave();
+    try {
+      ensureMusicGain();
+      musicGain.gain.value = save.musicOn ? 0.5 : 0;
+    } catch(e){}
+  }
+
+  // ---------- Unlock milestones ----------
+  const MILESTONES = [
+    { chai: 50,   key: 'scarf',    text: 'Cozy Pip unlocked! 🧣🐾' },
+    { chai: 150,  key: 'bg',       text: 'Cozy cabin background unlocked! 🏠✨' },
+    { chai: 300,  key: 'bird',     text: 'Bird friend unlocked! 🐦🐾' },
+    { chai: 500,  key: 'goldChai', text: 'Golden chai unlocked! ☕✨' },
+    { chai: 750,  key: 'wings',    text: 'Pilot Pip unlocked! ✈️🐾' },
+    { chai: 1000, key: 'monsoon',  text: 'Monsoon mode unlocked! 🌧️🍟' },
+    { chai: 1500, key: 'pilotFull',text: 'Captain Pip unlocked! 🎖️✈️' },
+    { chai: 2000, key: 'night',    text: 'Night Pip unlocked! 🌙👻🐾' }
+  ];
+  function nextMilestone(total){
+    for (const m of MILESTONES) if (!save.unlocks[m.key]) return m;
+    return null;
+  }
+
+  // ---------- Game state ----------
+  let state = 'start'; // start, rules, playing, paused, gameover
+  let score = 0;
+  let lives = 3;
+  let combo = 0;
+  let comboSinceMiss = 0;
+  let fallSpeedBase = 1.6;
+  let elapsed = 0;
+  let floaters = []; // floating text
+  let banners = []; // "Pip approves" banners
+  let popup = null; // unlock popup {text, timer}
+  let lastMilestoneCheckScore = 0;
+  let shakeTimer = 0;
+
+  // Pip player
+  const pip = {
+    x: BASE_W/2, y: BASE_H - 90, w: 56, h: 56, vx: 0, targetX: BASE_W/2,
+    wobble: 0
+  };
+  const MOVE_SPEED = 6.5;
+
+  // falling items
+  let items = []; // {x,y,r,type,speed}
+  let spawnTimer = 0;
+
+  // input
+  let keys = {};
+  window.addEventListener('keydown', e=>{
+    keys[e.key.toLowerCase()] = true;
+    try{ ac(); }catch(err){}
+    if (state === 'playing' && (e.key === ' ' )) togglePause();
+  });
+  window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+
+  let touchDir = 0;
+  canvas.addEventListener('touchstart', handleTouch, {passive:false});
+  canvas.addEventListener('touchmove', handleTouchMove, {passive:false});
+  canvas.addEventListener('touchend', e=>{ e.preventDefault(); touchDir = 0; }, {passive:false});
+  function touchToCanvasCoords(t){
+    const rect = canvas.getBoundingClientRect();
+    const scale = rect.width / BASE_W;
+    return { x: (t.clientX - rect.left) / scale, y: (t.clientY - rect.top) / scale, relX: (t.clientX - rect.left) / rect.width };
+  }
+  function handleTouch(e){
+    e.preventDefault();
+    if (!e.touches || e.touches.length === 0) return;
+    try{ ac(); }catch(err){}
+    const t = e.touches[0];
+    const pos = touchToCanvasCoords(t);
+
+    // music toggle is tappable in any state
+    if (pointInRect(pos.x, pos.y, musicBtnRect)) { toggleMusic(); return; }
+
+    if (state === 'start') { state = 'rules'; return; }
+    if (state === 'rules') { if (pointInRect(pos.x,pos.y,playBtnRect)) startGame(); return; }
+    if (state === 'gameover') { if (pointInRect(pos.x,pos.y,tryAgainRect)) state = 'rules'; return; }
+    if (state === 'playing' || state === 'paused') {
+      if (state === 'paused') { togglePause(); return; }
+      if (pointInRect(pos.x, pos.y, pauseBtnRect)) { togglePause(); return; }
+      touchDir = pos.relX < 0.5 ? -1 : 1;
+    }
+  }
+  function handleTouchMove(e){
+    e.preventDefault();
+    if (!e.touches || e.touches.length === 0) return;
+    if (state !== 'playing') return;
+    const t = e.touches[0];
+    const pos = touchToCanvasCoords(t);
+    if (pointInRect(pos.x, pos.y, pauseBtnRect)) return;
+    touchDir = pos.relX < 0.5 ? -1 : 1;
+  }
+  canvas.addEventListener('click', handleClick);
+  function handleClick(e){
+    try{ ac(); }catch(err){}
+    const rect = canvas.getBoundingClientRect();
+    const scale = rect.width / BASE_W;
+    const mx = (e.clientX - rect.left) / scale;
+    const my = (e.clientY - rect.top) / scale;
+
+    if (pointInRect(mx, my, musicBtnRect)) { toggleMusic(); return; }
+
+    if (state === 'start') {
+      if (pointInRect(mx,my,startBtnRect)) state = 'rules';
+    } else if (state === 'rules') {
+      if (pointInRect(mx,my,playBtnRect)) startGame();
+    } else if (state === 'gameover') {
+      if (pointInRect(mx,my,tryAgainRect)) state = 'rules';
+    } else if (state === 'playing' || state === 'paused') {
+      if (state === 'paused') { togglePause(); return; }
+      if (pointInRect(mx,my,pauseBtnRect)) togglePause();
+    }
+  }
+  function pointInRect(x,y,r){
+    return r && x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h;
+  }
+
+  let startBtnRect = {x: BASE_W/2-70, y: 420, w:140, h:50};
+  let playBtnRect = {x: BASE_W/2-70, y: 530, w:140, h:50};
+  let tryAgainRect = {x: BASE_W/2-70, y: 440, w:140, h:50};
+  let pauseBtnRect = {x: 8, y: 8, w: 30, h: 30};
+  let musicBtnRect = {x: BASE_W-38, y: 8, w: 30, h: 30};
+
+  function togglePause(){
+    if (state === 'playing') state = 'paused';
+    else if (state === 'paused') state = 'playing';
+  }
+
+  function startGame(){
+    score = 0; lives = 3; combo = 0; comboSinceMiss = 0; elapsed = 0;
+    fallSpeedBase = 1.6;
+    items = []; spawnTimer = 0; floaters = []; banners = []; popup = null;
+    lastMilestoneCheckScore = 0;
+    pip.x = BASE_W/2; pip.targetX = BASE_W/2; pip.wobble = 0;
+    state = 'playing';
+    try{ ac(); }catch(e){}
+  }
+
+  // ---------- Drawing helpers ----------
+  function roundRect(x,y,w,h,r){
+    ctx.beginPath();
+    ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r);
+    ctx.arcTo(x+w,y+h,x,y+h,r);
+    ctx.arcTo(x,y+h,x,y,r);
+    ctx.arcTo(x,y,x+w,y,r);
+    ctx.closePath();
+  }
+
+  function drawPip(x, y, w, wobbleT){
+    const scarfOn = save.unlocks.scarf;
+    const wingsOn = save.unlocks.wings || save.unlocks.pilotFull;
+    const pilotFullOn = save.unlocks.pilotFull;
+    const nightOn = save.unlocks.night;
+    const wobble = Math.sin(wobbleT*0.2) * 4;
+
+    ctx.save();
+    ctx.translate(x, y);
+
+    // stub feet
+    ctx.fillStyle = COL.orangeDark;
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2;
+    [[-w*0.22, w*0.42],[w*0.22, w*0.42]].forEach(p=>{
+      ctx.beginPath();
+      ctx.ellipse(p[0], p[1], w*0.11, w*0.08, 0, 0, Math.PI*2);
+      ctx.fill(); ctx.stroke();
+    });
+
+    // stub arms
+    [[-w*0.5, w*0.02],[w*0.5, w*0.02]].forEach(p=>{
+      ctx.beginPath();
+      ctx.ellipse(p[0], p[1], w*0.1, w*0.14, 0, 0, Math.PI*2);
+      ctx.fillStyle = COL.orange;
+      ctx.fill(); ctx.stroke();
+    });
+
+    // simple curled tail
+    ctx.save();
+    ctx.translate(w*0.4, w*0.1);
+    ctx.beginPath();
+    ctx.moveTo(0, w*0.08);
+    ctx.quadraticCurveTo(w*0.32, w*0.02, w*0.22, -w*0.28);
+    ctx.quadraticCurveTo(w*0.14, -w*0.16, w*0.02, 0);
+    ctx.closePath();
+    ctx.fillStyle = COL.orange;
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2.5;
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(w*0.19, -w*0.24, w*0.07, w*0.06, 0.5, 0, Math.PI*2);
+    ctx.fillStyle = COL.cream;
+    ctx.fill();
+    ctx.restore();
+
+    // body
+    ctx.beginPath();
+    ctx.arc(0, 0, w*0.5, 0, Math.PI*2);
+    ctx.fillStyle = COL.orange;
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = COL.outline;
+    ctx.stroke();
+
+    // belly patch
+    ctx.beginPath();
+    ctx.ellipse(0, w*0.16, w*0.36, w*0.3, 0, 0, Math.PI*2);
+    ctx.fillStyle = COL.cream;
+    ctx.fill();
+
+    // cheeks
+    ctx.fillStyle = COL.pink;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath(); ctx.ellipse(-w*0.32, -w*0.02, w*0.09, w*0.06, 0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(w*0.32, -w*0.02, w*0.09, w*0.06, 0,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // eyes - simple round eyes with solid pupils
+    const eyeY = -w*0.11;
+    [-1,1].forEach(s=>{
+      ctx.beginPath();
+      ctx.arc(s*w*0.19, eyeY, w*0.09, 0, Math.PI*2);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fill();
+      ctx.strokeStyle = COL.outline;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(s*w*0.19, eyeY, w*0.055, 0, Math.PI*2);
+      ctx.fillStyle = '#2E1B0F';
+      ctx.fill();
+    });
+
+    // nose
+    ctx.fillStyle = COL.pink;
+    ctx.beginPath(); ctx.arc(0, -w*0.02, w*0.03, 0, Math.PI*2); ctx.fill();
+
+    // simple smile
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, -w*0.02, w*0.08, 0.2, Math.PI-0.2);
+    ctx.stroke();
+
+    // scarf
+    if (scarfOn) {
+      ctx.fillStyle = '#D9564F';
+      ctx.strokeStyle = COL.outline;
+      roundRect(-w*0.28, w*0.18, w*0.56, w*0.14, 6);
+      ctx.fill(); ctx.stroke();
+    }
+
+    // pilot epaulettes on shoulders
+    if (wingsOn) {
+      ctx.fillStyle = '#D4AF37';
+      ctx.strokeStyle = COL.outline;
+      ctx.lineWidth = 1.5;
+      [-1,1].forEach(s=>{
+        roundRect(s*w*0.5 - w*0.08, -w*0.05, w*0.16, w*0.07, 2);
+        ctx.fill(); ctx.stroke();
+      });
+    }
+
+    // pilot wings badge on chest
+    if (pilotFullOn) {
+      ctx.fillStyle = COL.cream;
+      roundRect(-w*0.3, w*0.02, w*0.6, w*0.28, 8);
+      ctx.fill();
+      ctx.fillStyle = '#D4AF37';
+      ctx.strokeStyle = COL.outline;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.ellipse(-w*0.07, w*0.16, w*0.06, w*0.02, -0.3, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(w*0.07, w*0.16, w*0.06, w*0.02, 0.3, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, w*0.16, w*0.03, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+
+    // pakol hat - one simple rounded shape with a single rim line
+    ctx.save();
+    ctx.translate(0, -w*0.5);
+    ctx.rotate(wobble * Math.PI/180 * 0.15);
+
+    roundRect(-w*0.34, -w*0.14, w*0.68, w*0.22, w*0.11);
+    ctx.fillStyle = COL.pakol;
+    ctx.fill();
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(0,0,0,0.2)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(-w*0.3, w*0.03);
+    ctx.lineTo(w*0.3, w*0.03);
+    ctx.stroke();
+
+    ctx.restore();
+
+    // flashlight (night mode)
+    if (nightOn) {
+      ctx.fillStyle = '#CFCFCF';
+      ctx.strokeStyle = COL.outline;
+      roundRect(w*0.35, -w*0.05, w*0.14, w*0.08, 2);
+      ctx.fill(); ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawBird(x,y,t){
+    ctx.save();
+    ctx.translate(x, y + Math.sin(t*0.1)*4);
+    ctx.fillStyle = '#7EC4CF';
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(0,0,10,8,0,0,Math.PI*2);
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-10,0); ctx.lineTo(-16,-3); ctx.lineTo(-10,3);
+    ctx.closePath();
+    ctx.fillStyle = '#F0B94A';
+    ctx.fill();
+    ctx.fillStyle = COL.outline;
+    ctx.beginPath(); ctx.arc(4,-3,1.5,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawChaiCup(x,y,r,golden){
+    ctx.save();
+    ctx.translate(x,y);
+    // steam
+    ctx.strokeStyle = golden ? '#E8B84A' : '#C7BBA8';
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.7;
+    for (let i=-1;i<=1;i+=2){
+      ctx.beginPath();
+      ctx.moveTo(i*r*0.3, -r*0.9);
+      ctx.quadraticCurveTo(i*r*0.6, -r*1.3, i*r*0.2, -r*1.7);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    // cup
+    ctx.fillStyle = golden ? '#F5D061' : '#FFFFFF';
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-r*0.6, -r*0.5);
+    ctx.lineTo(r*0.6, -r*0.5);
+    ctx.lineTo(r*0.45, r*0.6);
+    ctx.lineTo(-r*0.45, r*0.6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // chai inside
+    ctx.fillStyle = golden ? COL.chaiGold : COL.chaiBrown;
+    ctx.beginPath();
+    ctx.ellipse(0, -r*0.5, r*0.58, r*0.12, 0, 0, Math.PI*2);
+    ctx.fill();
+    // handle
+    ctx.beginPath();
+    ctx.arc(r*0.65, -r*0.05, r*0.28, -0.6, 0.9);
+    ctx.stroke();
+    // heart
+    ctx.fillStyle = golden ? '#fff' : COL.pink;
+    ctx.font = `${r*0.5}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('♥', 0, r*0.35);
+    ctx.restore();
+  }
+
+  function drawObstacle(x,y,r,type){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2.5;
+    if (type === 'x') {
+      ctx.strokeStyle = '#D9564F';
+      ctx.beginPath();
+      ctx.moveTo(-r*0.5,-r*0.5); ctx.lineTo(r*0.5,r*0.5);
+      ctx.moveTo(r*0.5,-r*0.5); ctx.lineTo(-r*0.5,r*0.5);
+      ctx.stroke();
+    } else if (type === 'cloud') {
+      ctx.fillStyle = '#B8C4CC';
+      ctx.beginPath();
+      ctx.arc(-r*0.3,0,r*0.35,0,Math.PI*2);
+      ctx.arc(r*0.1,-r*0.15,r*0.4,0,Math.PI*2);
+      ctx.arc(r*0.4,0.05*r,r*0.3,0,Math.PI*2);
+      ctx.fill(); ctx.stroke();
+      ctx.strokeStyle = '#7FA8C9';
+      for (let i=-1;i<=1;i++){
+        ctx.beginPath();
+        ctx.moveTo(i*r*0.25, r*0.35);
+        ctx.lineTo(i*r*0.25-2, r*0.6);
+        ctx.stroke();
+      }
+    } else if (type === 'clock') {
+      ctx.fillStyle = '#EDEDED';
+      ctx.beginPath(); ctx.arc(0,0,r*0.45,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#D9564F';
+      [[-1],[1]].forEach(s=>{
+        ctx.beginPath();
+        ctx.arc(s[0]*r*0.4, -r*0.4, r*0.12, 0, Math.PI*2);
+        ctx.fill();
+      });
+      ctx.strokeStyle = COL.outline; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,-r*0.25); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(r*0.18,0.05*r); ctx.stroke();
+    } else if (type === 'pakora') {
+      ctx.fillStyle = '#D9A24B';
+      ctx.beginPath();
+      ctx.ellipse(0,0,r*0.4,r*0.32,0.3,0,Math.PI*2);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#B97F2E';
+      for (let i=0;i<4;i++){
+        ctx.beginPath();
+        ctx.arc((Math.random()-0.5)*r*0.5,(Math.random()-0.5)*r*0.4, r*0.05,0,Math.PI*2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  // ---------- Background ----------
+  function drawBackground(t){
+    const nightOn = save.unlocks.night;
+    const bgOn = save.unlocks.bg;
+    const monsoonOn = save.unlocks.monsoon;
+
+    if (nightOn) {
+      const g = ctx.createLinearGradient(0,0,0,BASE_H);
+      g.addColorStop(0,'#1B2440'); g.addColorStop(1,'#3A2E4F');
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,BASE_W,BASE_H);
+      // stars
+      ctx.fillStyle = '#FFF7D6';
+      for (let i=0;i<40;i++){
+        const sx = (i*67 + 13) % BASE_W;
+        const sy = (i*97 + 5) % (BASE_H-150);
+        ctx.globalAlpha = 0.4 + 0.4*Math.sin(t*0.05+i);
+        ctx.beginPath(); ctx.arc(sx,sy,1.4,0,Math.PI*2); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else if (bgOn) {
+      ctx.fillStyle = COL.sky;
+      ctx.fillRect(0,0,BASE_W,BASE_H);
+      // window
+      ctx.fillStyle = '#FCE9C6';
+      roundRect(BASE_W*0.62, 40, 100, 90, 8);
+      ctx.fill();
+      ctx.strokeStyle = COL.pakol; ctx.lineWidth = 4;
+      roundRect(BASE_W*0.62, 40, 100, 90, 8);
+      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(BASE_W*0.62+50,40); ctx.lineTo(BASE_W*0.62+50,130); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(BASE_W*0.62,85); ctx.lineTo(BASE_W*0.62+100,85); ctx.stroke();
+      // fairy lights
+      ctx.fillStyle = '#F5D061';
+      for (let i=0;i<10;i++){
+        const lx = 20 + i*38;
+        const ly = 20 + Math.sin(i*1.3)*6;
+        ctx.globalAlpha = 0.6+0.4*Math.sin(t*0.1+i);
+        ctx.beginPath(); ctx.arc(lx,ly,3,0,Math.PI*2); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = COL.sky;
+      ctx.fillRect(0,0,BASE_W,BASE_H*0.85);
+      ctx.fillStyle = COL.bg;
+      ctx.fillRect(0,BASE_H*0.85,BASE_W,BASE_H*0.15);
+    }
+
+    // monsoon rain overlay
+    if (monsoonOn && !nightOn) {
+      ctx.strokeStyle = 'rgba(120,150,190,0.5)';
+      ctx.lineWidth = 1.5;
+      for (let i=0;i<24;i++){
+        const rx = (i*53 + (t*4)%53);
+        const ry = (i*41 + (t*7)) % BASE_H;
+        ctx.beginPath();
+        ctx.moveTo(rx%BASE_W, ry);
+        ctx.lineTo(rx%BASE_W-4, ry+14);
+        ctx.stroke();
+      }
+    }
+
+    // ground line
+    ctx.fillStyle = COL.ground;
+    ctx.fillRect(0, BASE_H-40, BASE_W, 4);
+  }
+
+  // ---------- Update ----------
+  function spawnItem(){
+    const r = Math.random();
+    let type;
+    if (r < 0.62) type = 'chai';
+    else if (r < 0.72 && save.unlocks.goldChai) type = 'goldChai';
+    else if (r < 0.8 && save.unlocks.monsoon) type = 'pakora';
+    else {
+      const obstacles = ['x','cloud','clock'];
+      type = obstacles[Math.floor(Math.random()*obstacles.length)];
+    }
+    items.push({
+      x: 30 + Math.random()*(BASE_W-60),
+      y: -20,
+      r: 22,
+      type: type,
+      speed: fallSpeedBase + Math.random()*1.2
+    });
+  }
+
+  function addChai(amount, x, y){
+    score += amount;
+    save.totalChai += amount;
+    floaters.push({x, y, text: '☕+'+amount, life: 60, vy: -1.2});
+    checkMilestones();
+    if (score > 0 && score % 100 < amount) {
+      banners.push({text:'Pip approves ✅🐾', life: 75, maxLife: 75});
+    }
+    if (score > save.highScore) save.highScore = score;
+  }
+
+  function checkMilestones(){
+    const m = nextMilestone();
+    if (m && save.totalChai >= m.chai) {
+      save.unlocks[m.key] = true;
+      popup = { text: m.text, timer: 90 };
+      sfxUnlock();
+      writeSave();
+    }
+  }
+
+  function update(){
+    elapsed++;
+
+    if (state !== 'playing') return;
+
+    // movement
+    let dir = 0;
+    if (keys['arrowleft'] || keys['a']) dir = -1;
+    if (keys['arrowright'] || keys['d']) dir = 1;
+    if (dir === 0) dir = touchDir;
+
+    pip.x += dir * MOVE_SPEED;
+    pip.x = Math.max(30, Math.min(BASE_W-30, pip.x));
+    pip.wobble = dir !== 0 ? pip.wobble+1 : pip.wobble*0.9;
+
+    // difficulty ramps
+    fallSpeedBase = 1.6 + Math.min(elapsed/1800, 2.5);
+
+    // spawn
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      spawnItem();
+      spawnTimer = Math.max(22, 55 - Math.floor(elapsed/200));
+    }
+
+    // update items
+    for (let i = items.length-1; i>=0; i--) {
+      const it = items[i];
+      it.y += it.speed * 2;
+      if (it.y > BASE_H+30) { items.splice(i,1); continue; }
+
+      const dx = it.x - pip.x, dy = it.y - (pip.y-10);
+      const dist = Math.sqrt(dx*dx+dy*dy);
+      if (dist < it.r*0.7 + pip.w*0.35) {
+        if (it.type === 'chai' || it.type === 'goldChai') {
+          const pts = it.type === 'goldChai' ? 50 : 10;
+          comboSinceMiss++;
+          addChai(pts, it.x, it.y);
+          if (comboSinceMiss > 0 && comboSinceMiss % 3 === 0) {
+            addChai(50, it.x, it.y-20);
+          }
+          sfxCollect();
+        } else if (it.type === 'pakora') {
+          comboSinceMiss++;
+          addChai(30, it.x, it.y);
+          sfxCollect();
+        } else {
+          comboSinceMiss = 0;
+          lives--;
+          shakeTimer = 12;
+          sfxHit();
+          if (lives <= 0) {
+            endGame();
+          }
+        }
+        items.splice(i,1);
+      }
+    }
+
+    // floaters
+    for (let i=floaters.length-1;i>=0;i--){
+      const f = floaters[i];
+      f.y += f.vy; f.life--;
+      if (f.life<=0) floaters.splice(i,1);
+    }
+    // banners
+    for (let i=banners.length-1;i>=0;i--){
+      const b = banners[i];
+      b.life--;
+      if (b.life<=0) banners.splice(i,1);
+    }
+    if (popup) {
+      popup.timer--;
+      if (popup.timer<=0) popup = null;
+    }
+    if (shakeTimer>0) shakeTimer--;
+  }
+
+  function endGame(){
+    state = 'gameover';
+    writeSave();
+    sfxGameOver();
+  }
+
+  // ---------- Render ----------
+  function drawTopBar(){
+    // hearts (shifted right to clear the pause button)
+    for (let i=0;i<3;i++){
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = i < lives ? COL.pink : '#E5DCCB';
+      ctx.fillText('♥', 46 + i*22, 28);
+    }
+    // score
+    ctx.fillStyle = COL.text;
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(score.toString(), BASE_W/2, 32);
+    // high score
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('Best: '+save.highScore, BASE_W-42, 24);
+
+    // progress bar
+    const m = nextMilestone();
+    const barX = 14, barY = 54, barW = BASE_W-28, barH = 14;
+    ctx.fillStyle = COL.cream;
+    roundRect(barX,barY,barW,barH,7); ctx.fill();
+    ctx.strokeStyle = COL.pakol; ctx.lineWidth = 1.5;
+    roundRect(barX,barY,barW,barH,7); ctx.stroke();
+    if (m) {
+      const prevChai = MILESTONES.filter(x=>save.unlocks[x.key]).reduce((a,b)=>Math.max(a,b.chai),0);
+      const pct = Math.min(1, (save.totalChai - prevChai) / (m.chai - prevChai));
+      ctx.fillStyle = COL.chaiBrown;
+      roundRect(barX,barY,barW*pct,barH,7); ctx.fill();
+      ctx.fillStyle = COL.text;
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(save.totalChai + ' / ' + m.chai + ' chai', BASE_W/2, barY+barH+13);
+    } else {
+      ctx.fillStyle = COL.chaiGold;
+      roundRect(barX,barY,barW,barH,7); ctx.fill();
+      ctx.fillStyle = COL.text;
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('All unlocks complete! 🎉', BASE_W/2, barY+barH+13);
+    }
+
+    // pause button
+    ctx.fillStyle = COL.pakol;
+    roundRect(pauseBtnRect.x, pauseBtnRect.y, pauseBtnRect.w, pauseBtnRect.h, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(pauseBtnRect.x+9, pauseBtnRect.y+7, 4, 16);
+    ctx.fillRect(pauseBtnRect.x+17, pauseBtnRect.y+7, 4, 16);
+  }
+
+  function drawMusicButton(){
+    ctx.fillStyle = COL.pakol;
+    roundRect(musicBtnRect.x, musicBtnRect.y, musicBtnRect.w, musicBtnRect.h, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '15px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(save.musicOn ? '🔊' : '🔇', musicBtnRect.x+musicBtnRect.w/2, musicBtnRect.y+21);
+  }
+
+  function render(){
+    ctx.save();
+    if (shakeTimer>0) {
+      ctx.translate((Math.random()-0.5)*6, (Math.random()-0.5)*6);
+    }
+
+    drawBackground(elapsed);
+
+    if (state === 'start') {
+      renderStart();
+    } else if (state === 'rules') {
+      renderRules();
+    } else if (state === 'playing' || state === 'paused') {
+      // items
+      items.forEach(it=>{
+        if (it.type === 'chai') drawChaiCup(it.x, it.y, it.r, false);
+        else if (it.type === 'goldChai') drawChaiCup(it.x, it.y, it.r, true);
+        else if (it.type === 'pakora') drawObstacle(it.x, it.y, it.r, 'pakora');
+        else drawObstacle(it.x, it.y, it.r, it.type);
+      });
+
+      // bird companion
+      if (save.unlocks.bird) drawBird(pip.x - 40, pip.y - 30, elapsed);
+
+      drawPip(pip.x, pip.y, pip.w, pip.wobble);
+
+      // floaters
+      floaters.forEach(f=>{
+        ctx.globalAlpha = Math.max(0, f.life/60);
+        ctx.fillStyle = COL.chaiBrown;
+        ctx.font = 'bold 15px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(f.text, f.x, f.y);
+        ctx.globalAlpha = 1;
+      });
+      // banners
+      banners.forEach(b=>{
+        const t = 1 - b.life/b.maxLife;
+        const fade = t < 0.15 ? t/0.15 : (t > 0.75 ? (1-t)/0.25 : 1);
+        const scale = t < 0.15 ? 0.8 + 0.2*(t/0.15) : 1;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, fade);
+        ctx.translate(BASE_W/2, 180);
+        ctx.scale(scale, scale);
+        ctx.fillStyle = COL.text;
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(b.text, 0, 0);
+        ctx.restore();
+      });
+
+      drawTopBar();
+
+      if (popup) {
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.fillRect(0,0,BASE_W,BASE_H);
+        ctx.fillStyle = '#fff';
+        roundRect(BASE_W/2-140, BASE_H/2-60, 280, 120, 16);
+        ctx.fill();
+        ctx.strokeStyle = COL.pakol; ctx.lineWidth = 3;
+        roundRect(BASE_W/2-140, BASE_H/2-60, 280, 120, 16);
+        ctx.stroke();
+        ctx.fillStyle = COL.text;
+        ctx.font = 'bold 16px sans-serif';
+        ctx.textAlign = 'center';
+        wrapText(popup.text, BASE_W/2, BASE_H/2, 240, 22);
+      }
+
+      if (state === 'paused') {
+        ctx.fillStyle = 'rgba(255,248,240,0.85)';
+        ctx.fillRect(0,0,BASE_W,BASE_H);
+        drawPip(BASE_W/2, BASE_H/2, 80, 0);
+        ctx.fillStyle = COL.text;
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('apna kaam karo 😌', BASE_W/2, BASE_H/2+70);
+        ctx.font = '14px sans-serif';
+        ctx.fillText('(tap anywhere to resume)', BASE_W/2, BASE_H/2+95);
+      }
+    } else if (state === 'gameover') {
+      renderGameOver();
+    }
+
+    ctx.restore();
+    drawMusicButton();
+  }
+
+  function wrapText(text, x, y, maxWidth, lineHeight){
+    const words = text.split(' ');
+    let line = '';
+    let lines = [];
+    for (let w of words) {
+      const test = line + w + ' ';
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line); line = w + ' ';
+      } else line = test;
+    }
+    lines.push(line);
+    const startY = y - (lines.length-1)*lineHeight/2;
+    lines.forEach((l,i)=> ctx.fillText(l.trim(), x, startY + i*lineHeight));
+  }
+
+  function renderStart(){
+    ctx.fillStyle = COL.text;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 30px sans-serif';
+    ctx.fillText("Pip's Chai Run", BASE_W/2, 130);
+    ctx.font = '26px sans-serif';
+    ctx.fillText('☕🐾', BASE_W/2, 165);
+    ctx.font = '15px sans-serif';
+    ctx.fillText('Collect chai. Unlock everything.', BASE_W/2, 210);
+    ctx.fillText('Pip demands it. 😂', BASE_W/2, 232);
+
+    // Pip waving with a chai cup
+    drawPip(BASE_W/2, 320, 90, elapsed*0.3);
+    drawChaiCup(BASE_W/2+70, 300, 26, false);
+
+    // start button
+    ctx.fillStyle = COL.pakol;
+    roundRect(startBtnRect.x, startBtnRect.y, startBtnRect.w, startBtnRect.h, 16);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.fillText('START', BASE_W/2, startBtnRect.y+33);
+
+    ctx.fillStyle = COL.text;
+    ctx.font = '12px sans-serif';
+    ctx.fillText('Arrow keys / A-D, or tap left & right', BASE_W/2, 500);
+    ctx.fillText('High score: ' + save.highScore, BASE_W/2, 522);
+    ctx.font = '11px sans-serif';
+    ctx.fillText('🔊 top-right toggles music', BASE_W/2, 544);
+  }
+
+  function renderRules(){
+    ctx.fillStyle = COL.text;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText('How to Play 🐾', BASE_W/2, 54);
+
+    ctx.textAlign = 'left';
+    const lx = 28;
+    let ly = 96;
+    const lh = 25;
+
+    function rule(icon, text){
+      ctx.font = '20px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(icon, lx, ly);
+      ctx.font = '14px sans-serif';
+      ctx.fillStyle = COL.text;
+      const numLines = wrapTextLeft(text, lx+30, ly-5, BASE_W-lx-30-16, 17);
+      ly += Math.max(lh, numLines*17) + 10;
+    }
+
+    rule('🎮', 'Move Pip with arrow keys or A/D. On mobile, tap the left or right side of the screen.');
+    rule('☕', 'Catch falling chai cups to score +10 points each.');
+    rule('🔥', 'Catch 3 chai in a row for a +50 combo bonus!');
+    rule('🚫', 'Avoid the red X, rain cloud, and alarm clock — they cost a life.');
+    rule('💔', 'You have 3 lives. Lose them all and it\'s game over.');
+    rule('📈', 'Collect chai to fill the progress bar and unlock cozy new surprises for Pip!');
+    rule('⏸️', 'Tap the pause icon anytime to take a break.');
+
+    // Play button
+    ctx.fillStyle = COL.pakol;
+    roundRect(playBtnRect.x, playBtnRect.y, playBtnRect.w, playBtnRect.h, 16);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('PLAY', BASE_W/2, playBtnRect.y+33);
+  }
+
+  function wrapTextLeft(text, x, y, maxWidth, lineHeight){
+    const words = text.split(' ');
+    let line = '';
+    let lines = [];
+    for (let w of words) {
+      const test = line + w + ' ';
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line); line = w + ' ';
+      } else line = test;
+    }
+    lines.push(line);
+    lines.forEach((l,i)=> ctx.fillText(l.trim(), x, y + i*lineHeight));
+    return lines.length;
+  }
+
+  function renderGameOver(){
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillRect(0,0,BASE_W,BASE_H);
+
+    // Pip on his back
+    ctx.save();
+    ctx.translate(BASE_W/2, 260);
+    ctx.rotate(Math.PI);
+    drawPip(0,0,90,0);
+    // paws up
+    ctx.restore();
+    ctx.fillStyle = COL.text;
+    ctx.font = '22px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('😭', BASE_W/2, 320);
+
+    ctx.font = 'bold 26px sans-serif';
+    ctx.fillText('Game Over', BASE_W/2, 370);
+
+    ctx.font = '16px sans-serif';
+    ctx.fillText('Score: ' + score, BASE_W/2, 400);
+    ctx.fillText('High score: ' + save.highScore, BASE_W/2, 422);
+
+    ctx.fillStyle = COL.pakol;
+    roundRect(tryAgainRect.x, tryAgainRect.y, tryAgainRect.w, tryAgainRect.h, 16);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px sans-serif';
+    ctx.fillText('TRY AGAIN', BASE_W/2, tryAgainRect.y+33);
+
+    ctx.fillStyle = COL.text;
+    ctx.font = '12px sans-serif';
+    ctx.fillText('All unlocked items are saved! 🐾✨', BASE_W/2, 512);
+  }
+
+  // ---------- Main loop ----------
+  function loop(){
+    update();
+    updateMusicScheduler();
+    render();
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>
